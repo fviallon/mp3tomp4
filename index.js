@@ -7,12 +7,18 @@ import { spawn } from "child_process";
 
 const app = express();
 
-// Limits help prevent accidental huge uploads from killing free-tier memory.
+// Prevent accidental large uploads from killing free-tier memory.
 const upload = multer({
   dest: "/tmp",
   limits: {
     fileSize: 50 * 1024 * 1024, // 50 MB per file
   },
+});
+
+// Log every request (super useful to confirm Make actually hits the service)
+app.use((req, _res, next) => {
+  console.log(new Date().toISOString(), req.method, req.url);
+  next();
 });
 
 app.get("/", (_req, res) => res.send("OK"));
@@ -23,7 +29,7 @@ app.get("/", (_req, res) => res.send("OK"));
  *  - audio: mp3 file
  *  - image: jpg/png file
  *
- * Returns: video/mp4 (image still + audio)
+ * Returns: video/mp4 (still image + audio)
  */
 app.post(
   "/convert",
@@ -32,6 +38,8 @@ app.post(
     { name: "image", maxCount: 1 },
   ]),
   (req, res) => {
+    console.log("START /convert", new Date().toISOString());
+
     const audioFile = req.files?.audio?.[0];
     const imageFile = req.files?.image?.[0];
 
@@ -42,16 +50,13 @@ app.post(
     const audioPath = audioFile.path;
     const imagePath = imageFile.path;
 
-    // Optional: log sizes for debugging in Render logs
+    // Debug sizes (helps spot oversized covers etc.)
     console.log("audio size:", audioFile.size);
     console.log("image size:", imageFile.size);
 
     const outPath = path.join("/tmp", `output-${Date.now()}.mp4`);
 
-    // Key points for Render free tier:
-    // - use spawn (not exec/execFile) to avoid buffering stdout/stderr in RAM
-    // - reduce ffmpeg verbosity
-    // - downscale image to reduce memory/CPU
+    // Keep ffmpeg light & quiet (avoids RAM spikes from logs)
     const args = [
       "-y",
       "-loglevel",
@@ -92,7 +97,7 @@ app.post(
     });
 
     ff.on("error", (err) => {
-      console.error("spawn error:", err);
+      console.error("ffmpeg spawn error:", err);
       cleanupFiles([audioPath, imagePath, outPath]);
       return res.status(500).json({ error: "ffmpeg_spawn_failed" });
     });
@@ -106,22 +111,39 @@ app.post(
           .json({ error: "ffmpeg_failed", code, details: errTail });
       }
 
-      res.setHeader("Content-Type", "video/mp4");
-      res.setHeader(
-        "Content-Disposition",
-        'attachment; filename="output.mp4"'
-      );
+      console.log("FFMPEG OK, sending mp4", new Date().toISOString());
 
-      const stream = fs.createReadStream(outPath);
-      stream.pipe(res);
+      // Important for Make: send Content-Length (some clients dislike unknown-length streams)
+      fs.stat(outPath, (err, stat) => {
+        if (err) {
+          console.error("stat failed:", err);
+          cleanupFiles([audioPath, imagePath, outPath]);
+          return res.status(500).json({ error: "stat_failed" });
+        }
 
-      stream.on("close", () => {
-        cleanupFiles([audioPath, imagePath, outPath]);
-      });
+        res.setHeader("Content-Type", "video/mp4");
+        res.setHeader(
+          "Content-Disposition",
+          'attachment; filename="output.mp4"'
+        );
+        res.setHeader("Content-Length", stat.size);
 
-      stream.on("error", (e) => {
-        console.error("read stream error:", e);
-        cleanupFiles([audioPath, imagePath, outPath]);
+        // Cleanup after the response is truly finished
+        res.on("finish", () => {
+          console.log("RESPONSE FINISHED", new Date().toISOString());
+          cleanupFiles([audioPath, imagePath, outPath]);
+        });
+
+        const stream = fs.createReadStream(outPath);
+        stream.on("error", (e) => {
+          console.error("read stream error:", e);
+          cleanupFiles([audioPath, imagePath, outPath]);
+          try {
+            res.end();
+          } catch {}
+        });
+
+        stream.pipe(res);
       });
     });
   }
