@@ -8,15 +8,19 @@ import { spawn } from "child_process";
 const app = express();
 app.set("trust proxy", 1);
 
-// Upload config
+/* -------------------------------------------------- */
+/* Upload config                                      */
+/* -------------------------------------------------- */
 const upload = multer({
   dest: "/tmp",
   limits: {
-    fileSize: 50 * 1024 * 1024,
-  },
+    fileSize: 50 * 1024 * 1024 // 50 MB
+  }
 });
 
-// Request log
+/* -------------------------------------------------- */
+/* Logs (indispensable pour debug Make / Render)      */
+/* -------------------------------------------------- */
 app.use((req, _res, next) => {
   console.log(new Date().toISOString(), req.method, req.url);
   next();
@@ -24,9 +28,9 @@ app.use((req, _res, next) => {
 
 app.get("/", (_req, res) => res.send("OK"));
 
-/**
- * id -> { path, createdAt }
- */
+/* -------------------------------------------------- */
+/* Download registry (convert → download)             */
+/* -------------------------------------------------- */
 const downloads = new Map();
 const DOWNLOAD_TTL_MS = 10 * 60 * 1000;
 
@@ -41,11 +45,14 @@ setInterval(() => {
   }
 }, 60 * 1000);
 
+/* -------------------------------------------------- */
+/* POST /convert                                      */
+/* -------------------------------------------------- */
 app.post(
   "/convert",
   upload.fields([
     { name: "audio", maxCount: 1 },
-    { name: "image", maxCount: 1 },
+    { name: "image", maxCount: 1 }
   ]),
   (req, res) => {
     console.log("START /convert", new Date().toISOString());
@@ -54,7 +61,7 @@ app.post(
     const imageFile = req.files?.image?.[0];
 
     if (!audioFile || !imageFile) {
-      return res.status(400).json({ error: "Missing 'audio' or 'image' file" });
+      return res.status(400).json({ error: "Missing audio or image" });
     }
 
     const audioPath = audioFile.path;
@@ -68,47 +75,42 @@ app.post(
       `output-${Date.now()}-${Math.random().toString(16).slice(2)}.mp4`
     );
 
-    // ✅ Important : -loglevel info pendant debug (tu pourras remettre "error" après)
+    /* -------------------------------------------------- */
+    /* FFmpeg args — ULTRA LIGHT CPU (Render free safe)   */
+    /* -------------------------------------------------- */
     const args = [
       "-y",
       "-nostdin",
       "-hide_banner",
-      "-loglevel", "info",
+      "-loglevel", "error",
+
       "-loop", "1",
       "-i", imagePath,
       "-i", audioPath,
-      "-vf", "scale=1280:-2,fps=1",
+
+      // Video: ultra light (image fixe)
+      "-vf", "scale=854:-2,fps=1,format=yuv420p",
       "-c:v", "libx264",
-      "-preset", "veryfast",
-      "-tune", "stillimage",
+      "-preset", "ultrafast",
+      "-profile:v", "baseline",
+      "-level", "3.0",
+      "-x264-params", "bframes=0:ref=1:scenecut=0:subme=0:me=dia:trellis=0",
+      "-threads", "1",
+
+      // Audio
       "-c:a", "aac",
-      "-b:a", "128k",
+      "-b:a", "96k",
+      "-ac", "1",
+
       "-shortest",
-      "-pix_fmt", "yuv420p",
       "-movflags", "+faststart",
-      outPath,
+      outPath
     ];
 
     const ff = spawn("ffmpeg", args, { stdio: ["ignore", "ignore", "pipe"] });
     console.log("FFMPEG STARTED pid=", ff.pid);
 
-    // 🔒 Verrou : une seule réponse possible
     let responded = false;
-
-    // Garder un petit buffer d’erreur + loguer quelques lignes
-    let errTail = "";
-    let lineCount = 0;
-    ff.stderr.on("data", (chunk) => {
-      const s = chunk.toString();
-      errTail += s;
-      if (errTail.length > 12000) errTail = errTail.slice(-12000);
-
-      // Log seulement les ~25 premières lignes pour voir où ça bloque
-      if (lineCount < 25) {
-        console.log("[ffmpeg]", s.trim());
-        lineCount += (s.match(/\n/g) || []).length + 1;
-      }
-    });
 
     const safeRespond = (status, payload) => {
       if (responded || res.headersSent) return;
@@ -116,13 +118,15 @@ app.post(
       res.status(status).json(payload);
     };
 
-    // Watchdog : 60s suffisent largement pour 3–5 min d’audio
+    /* -------------------------------------------------- */
+    /* Watchdog (Render free = lent mais pas bloqué)      */
+    /* -------------------------------------------------- */
     const watchdog = setTimeout(() => {
       console.error("FFMPEG TIMEOUT -> killing process", ff.pid);
       try { ff.kill("SIGKILL"); } catch {}
       cleanupFiles([audioPath, imagePath, outPath]);
       safeRespond(504, { error: "ffmpeg_timeout" });
-    }, 60000);
+    }, 180000); // 3 minutes
 
     ff.on("error", (err) => {
       clearTimeout(watchdog);
@@ -134,28 +138,27 @@ app.post(
     ff.on("close", (code, signal) => {
       clearTimeout(watchdog);
 
-      console.log("FFMPEG CLOSED code=", code, "signal=", signal);
+      // Inputs can always be removed
+      cleanupFiles([audioPath, imagePath]);
 
-      // Si le watchdog a déjà répondu, on sort sans rien renvoyer
       if (responded || res.headersSent) {
-        cleanupFiles([audioPath, imagePath, outPath]);
+        cleanupFiles([outPath]);
         return;
       }
 
-      // Toujours supprimer les inputs
-      cleanupFiles([audioPath, imagePath]);
-
       if (code !== 0) {
-        console.error("ffmpeg failed, code:", code, "signal:", signal);
+        console.error("ffmpeg failed", { code, signal });
         cleanupFiles([outPath]);
         return safeRespond(500, {
           error: "ffmpeg_failed",
           code,
-          signal,
-          details: errTail.slice(-4000),
+          signal
         });
       }
 
+      /* -------------------------------------------------- */
+      /* Register MP4 for download                          */
+      /* -------------------------------------------------- */
       const id = `dl-${Date.now()}-${Math.random().toString(16).slice(2)}`;
       downloads.set(id, { path: outPath, createdAt: Date.now() });
 
@@ -163,17 +166,20 @@ app.post(
       const host = req.get("host");
       const url = `${proto}://${host}/download/${id}`;
 
-      console.log("FFMPEG OK ->", id, url);
+      console.log("FFMPEG OK →", url);
 
       safeRespond(200, {
         url,
         id,
-        expires_in_seconds: Math.floor(DOWNLOAD_TTL_MS / 1000),
+        expires_in_seconds: Math.floor(DOWNLOAD_TTL_MS / 1000)
       });
     });
   }
 );
 
+/* -------------------------------------------------- */
+/* GET /download/:id                                  */
+/* -------------------------------------------------- */
 app.get("/download/:id", (req, res) => {
   const info = downloads.get(req.params.id);
   if (!info) return res.status(404).send("Not Found");
@@ -194,6 +200,9 @@ app.get("/download/:id", (req, res) => {
   });
 });
 
+/* -------------------------------------------------- */
+/* Errors                                             */
+/* -------------------------------------------------- */
 app.use((err, _req, res, _next) => {
   if (err?.code === "LIMIT_FILE_SIZE") {
     return res.status(413).json({ error: "File too large" });
@@ -202,6 +211,9 @@ app.use((err, _req, res, _next) => {
   return res.status(500).json({ error: "server_error" });
 });
 
+/* -------------------------------------------------- */
+/* Utils                                              */
+/* -------------------------------------------------- */
 function cleanupFiles(paths) {
   for (const p of paths) {
     if (!p) continue;
@@ -209,5 +221,8 @@ function cleanupFiles(paths) {
   }
 }
 
+/* -------------------------------------------------- */
+/* Server                                             */
+/* -------------------------------------------------- */
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`Listening on ${port}`));
